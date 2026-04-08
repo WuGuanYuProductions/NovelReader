@@ -1,0 +1,1902 @@
+import json
+import logging
+import os
+import shutil
+import sqlite3
+import sys
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+from PySide6.QtCore import QObject, Qt, Signal, QLockFile
+from PySide6.QtGui import QAction, QFont, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QSystemTrayIcon,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+import fitz  # PyMuPDF
+from bs4 import BeautifulSoup
+from ebooklib import ITEM_DOCUMENT, ITEM_IMAGE, epub
+
+try:
+    import mobi  # type: ignore
+except Exception:
+    mobi = None
+
+try:
+    import keyboard  # type: ignore
+except Exception:
+    keyboard = None
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+
+def get_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+BASE_DIR = get_base_dir()
+RESOURCES_DIR = BASE_DIR / "Resources"
+CACHE_DIR = BASE_DIR / "cache"
+COVERS_DIR = CACHE_DIR / "covers"
+DATA_DIR = BASE_DIR / "data"
+SAVES_DIR = BASE_DIR / "Saves"
+DB_PATH = DATA_DIR / "app.db"
+LOCK_PATH = DATA_DIR / "app_instance.lock"
+
+for path in [RESOURCES_DIR, CACHE_DIR, COVERS_DIR, DATA_DIR, SAVES_DIR]:
+    path.mkdir(parents=True, exist_ok=True)
+
+SUPPORTED_EXTENSIONS = {".txt", ".pdf", ".epub", ".mobi"}
+
+
+@dataclass
+class BookRecord:
+    id: int
+    title: str
+    file_path: str
+    file_type: str
+    cover_path: Optional[str]
+
+
+class SingleInstanceGuard:
+    def __init__(self, lock_path: Path) -> None:
+        self.lock_file = QLockFile(str(lock_path))
+        self.lock_file.setStaleLockTime(0)
+
+    def try_acquire(self) -> bool:
+        if self.lock_file.tryLock(100):
+            return True
+
+        try:
+            self.lock_file.removeStaleLockFile()
+        except Exception:
+            logging.exception("清理陈旧锁文件失败")
+
+        return self.lock_file.tryLock(100)
+
+    def release(self) -> None:
+        if self.lock_file.isLocked():
+            self.lock_file.unlock()
+
+
+def normalize_hotkey_for_keyboard(shortcut_text: str) -> str:
+    if not shortcut_text.strip():
+        return "ctrl+`"
+
+    normalized = shortcut_text.strip().lower()
+    replacements = {
+        "ctrl": "ctrl",
+        "control": "ctrl",
+        "shift": "shift",
+        "alt": "alt",
+        "meta": "windows",
+        "win": "windows",
+        "del": "delete",
+        "ins": "insert",
+        "return": "enter",
+        "esc": "esc",
+        "pgup": "page up",
+        "pgdown": "page down",
+    }
+
+    parts = [part.strip() for part in normalized.replace("＋", "+").split("+") if part.strip()]
+    mapped_parts: list[str] = []
+
+    for part in parts:
+        mapped_parts.append(replacements.get(part, part))
+
+    return "+".join(mapped_parts)
+
+
+def is_same_path(path_a: Path, path_b: Path) -> bool:
+    try:
+        return path_a.resolve(strict=False) == path_b.resolve(strict=False)
+    except Exception:
+        return str(path_a).lower() == str(path_b).lower()
+
+
+def has_supported_books(directory: Path) -> bool:
+    if not directory.exists() or not directory.is_dir():
+        return False
+
+    try:
+        for path in directory.rglob("*"):
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                return True
+    except Exception:
+        logging.exception("检查目录内书籍文件失败: %s", directory)
+
+    return False
+
+
+class Database:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+        self.conn = sqlite3.connect(str(db_path))
+        self.conn.row_factory = sqlite3.Row
+        self.init_db()
+
+    def init_db(self) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS books (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                file_path TEXT NOT NULL UNIQUE,
+                file_type TEXT NOT NULL,
+                cover_path TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS progress (
+                book_id INTEGER PRIMARY KEY,
+                position TEXT NOT NULL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                position TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self.conn.commit()
+
+        self.set_default_setting("opacity", "1.0")
+        self.set_default_setting("font_size", "16")
+        self.set_default_setting("toggle_shortcut", "Ctrl+`")
+        self.set_default_setting("last_book_id", "")
+        self.set_default_setting("tray_icon_path", self.get_default_tray_icon_path())
+        self.set_default_setting("main_window_geometry", "")
+        self.set_default_setting("bookshelf_dir", "")
+        self.set_default_setting("tray_hint_shown", "0")
+
+    def get_default_tray_icon_path(self) -> str:
+        icon_jpg = RESOURCES_DIR / "Icon.jpg"
+        if icon_jpg.exists():
+            return str(icon_jpg.resolve())
+
+        icon_jpeg = RESOURCES_DIR / "Icon.jpeg"
+        if icon_jpeg.exists():
+            return str(icon_jpeg.resolve())
+
+        jpg_candidates = list(RESOURCES_DIR.glob("*.jpg")) + list(RESOURCES_DIR.glob("*.jpeg"))
+        if jpg_candidates:
+            return str(jpg_candidates[0].resolve())
+
+        icon_ico = RESOURCES_DIR / "TrayIcon.ico"
+        if icon_ico.exists():
+            return str(icon_ico.resolve())
+
+        return ""
+
+    def set_default_setting(self, key: str, value: str) -> None:
+        if self.get_setting(key) is None:
+            self.set_setting(key, value)
+
+    def get_setting(self, key: str) -> Optional[str]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        self.conn.commit()
+
+    def add_book(self, title: str, file_path: str, file_type: str, cover_path: Optional[str]) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO books (title, file_path, file_type, cover_path)
+            VALUES (?, ?, ?, ?)
+            """,
+            (title, file_path, file_type, cover_path),
+        )
+        self.conn.commit()
+
+    def get_books(self) -> list[BookRecord]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM books ORDER BY id DESC")
+        rows = cursor.fetchall()
+        return [
+            BookRecord(
+                id=row["id"],
+                title=row["title"],
+                file_path=row["file_path"],
+                file_type=row["file_type"],
+                cover_path=row["cover_path"],
+            )
+            for row in rows
+        ]
+
+    def get_book(self, book_id: int) -> Optional[BookRecord]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM books WHERE id = ?", (book_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return BookRecord(
+            id=row["id"],
+            title=row["title"],
+            file_path=row["file_path"],
+            file_type=row["file_type"],
+            cover_path=row["cover_path"],
+        )
+
+    def delete_book(self, book_id: int) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM bookmarks WHERE book_id = ?", (book_id,))
+        cursor.execute("DELETE FROM progress WHERE book_id = ?", (book_id,))
+        cursor.execute("DELETE FROM books WHERE id = ?", (book_id,))
+        self.conn.commit()
+
+    def delete_book_by_path(self, file_path: str) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id FROM books WHERE file_path = ?", (file_path,))
+        row = cursor.fetchone()
+        if not row:
+            return
+        self.delete_book(int(row["id"]))
+
+    def save_progress(self, book_id: int, position: dict[str, Any]) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO progress (book_id, position) VALUES (?, ?)
+            ON CONFLICT(book_id) DO UPDATE SET position = excluded.position, updated_at = CURRENT_TIMESTAMP
+            """,
+            (book_id, json.dumps(position, ensure_ascii=False)),
+        )
+        self.conn.commit()
+
+    def get_progress(self, book_id: int) -> Optional[dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT position FROM progress WHERE book_id = ?", (book_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        try:
+            data = json.loads(row["position"])
+            return data if isinstance(data, dict) else None
+        except Exception:
+            logging.exception("读取阅读进度失败")
+            return None
+
+    def add_bookmark(self, book_id: int, name: str, position: dict[str, Any]) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO bookmarks (book_id, name, position) VALUES (?, ?, ?)",
+            (book_id, name, json.dumps(position, ensure_ascii=False)),
+        )
+        self.conn.commit()
+
+        book = self.get_book(book_id)
+        if not book:
+            return
+
+        SAVES_DIR.mkdir(parents=True, exist_ok=True)
+        save_data = {
+            "book_id": book_id,
+            "title": book.title,
+            "name": name,
+            "position": position,
+        }
+        safe_title = "".join(ch for ch in book.title if ch not in '\\/:*?"<>|').strip() or f"book_{book_id}"
+        safe_name = "".join(ch for ch in name if ch not in '\\/:*?"<>|').strip() or "bookmark"
+        save_file = SAVES_DIR / f"{safe_title}_{safe_name}_{uuid.uuid4().hex[:8]}.json"
+        save_file.write_text(json.dumps(save_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def get_bookmarks(self) -> list[sqlite3.Row]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT bookmarks.id, bookmarks.name, bookmarks.position, bookmarks.created_at,
+                   books.id AS book_id, books.title
+            FROM bookmarks
+            JOIN books ON books.id = bookmarks.book_id
+            ORDER BY bookmarks.id DESC
+            """
+        )
+        return cursor.fetchall()
+
+    def delete_bookmark(self, bookmark_id: int) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM bookmarks WHERE id = ?", (bookmark_id,))
+        self.conn.commit()
+
+
+class BookParser:
+    @staticmethod
+    def extract_title(file_path: Path) -> str:
+        return file_path.stem
+
+    @staticmethod
+    def extract_cover(file_path: Path) -> Optional[str]:
+        ext = file_path.suffix.lower()
+
+        if ext == ".epub":
+            try:
+                book = epub.read_epub(str(file_path))
+                for item in book.get_items():
+                    if item.get_type() == ITEM_IMAGE and "cover" in item.get_name().lower():
+                        cover_name = f"{uuid.uuid4().hex}.jpg"
+                        cover_path = COVERS_DIR / cover_name
+                        cover_path.write_bytes(item.get_content())
+                        return str(cover_path)
+            except Exception:
+                logging.exception("提取 EPUB 封面失败")
+                return None
+
+        return None
+
+    @staticmethod
+    def parse_txt(file_path: Path) -> dict[str, Any]:
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+        return {
+            "mode": "text",
+            "content": content,
+            "toc": [],
+            "meta": {},
+        }
+
+    @staticmethod
+    def parse_pdf(file_path: Path) -> dict[str, Any]:
+        document = fitz.open(str(file_path))
+        toc = document.get_toc(simple=True)
+        return {
+            "mode": "pdf",
+            "doc": document,
+            "page_count": len(document),
+            "toc": toc,
+            "meta": {},
+        }
+
+    @staticmethod
+    def parse_epub(file_path: Path) -> dict[str, Any]:
+        book = epub.read_epub(str(file_path))
+        html_parts: list[str] = []
+        toc_entries: list[dict[str, Any]] = []
+        offset = 0
+
+        for item in book.get_items():
+            if item.get_type() == ITEM_DOCUMENT:
+                html = item.get_content().decode("utf-8", errors="ignore")
+                soup = BeautifulSoup(html, "html.parser")
+                text = soup.get_text("\n", strip=True)
+                if text:
+                    title = soup.title.string.strip() if soup.title and soup.title.string else item.get_name()
+                    toc_entries.append({"title": title, "offset": offset})
+                    html_parts.append(text)
+                    offset += len(text) + 2
+
+        return {
+            "mode": "text",
+            "content": "\n\n".join(html_parts),
+            "toc": toc_entries,
+            "meta": {},
+        }
+
+    @staticmethod
+    def parse_mobi(file_path: Path) -> dict[str, Any]:
+        if mobi is None:
+            return {
+                "mode": "text",
+                "content": "当前环境未安装 mobi 解析库，暂仅显示文件路径：\n\n" + str(file_path),
+                "toc": [],
+                "meta": {},
+            }
+
+        try:
+            temp_dir = CACHE_DIR / f"mobi_{uuid.uuid4().hex}"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            extracted_path, _ = mobi.extract(str(file_path), str(temp_dir))
+            html_files = list(Path(extracted_path).rglob("*.html")) + list(Path(extracted_path).rglob("*.htm"))
+            content_parts: list[str] = []
+            toc_entries: list[dict[str, Any]] = []
+            offset = 0
+
+            for html_file in html_files:
+                html = html_file.read_text(encoding="utf-8", errors="ignore")
+                soup = BeautifulSoup(html, "html.parser")
+                text = soup.get_text("\n", strip=True)
+                if text:
+                    toc_entries.append({"title": html_file.stem, "offset": offset})
+                    content_parts.append(text)
+                    offset += len(text) + 2
+
+            return {
+                "mode": "text",
+                "content": "\n\n".join(content_parts) if content_parts else f"无法提取 MOBI 文本：{file_path}",
+                "toc": toc_entries,
+                "meta": {},
+            }
+        except Exception:
+            logging.exception("解析 MOBI 失败")
+            return {
+                "mode": "text",
+                "content": f"MOBI 解析失败：{file_path}",
+                "toc": [],
+                "meta": {},
+            }
+
+    @classmethod
+    def parse(cls, file_path: str) -> dict[str, Any]:
+        path = Path(file_path)
+        ext = path.suffix.lower()
+
+        if ext == ".txt":
+            return cls.parse_txt(path)
+        if ext == ".pdf":
+            return cls.parse_pdf(path)
+        if ext == ".epub":
+            return cls.parse_epub(path)
+        if ext == ".mobi":
+            return cls.parse_mobi(path)
+
+        return {
+            "mode": "text",
+            "content": "不支持的格式",
+            "toc": [],
+            "meta": {},
+        }
+
+
+class GlobalHotkeyManager(QObject):
+    toggleRequested = Signal()
+
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self.hotkey_handle: Optional[Any] = None
+        self.current_shortcut_text = ""
+        self.is_keyboard_available = keyboard is not None
+
+    def register_hotkey(self, shortcut_text: str) -> tuple[bool, str]:
+        self.unregister_hotkey()
+
+        normalized_shortcut = shortcut_text.strip() or "Ctrl+`"
+        self.current_shortcut_text = normalized_shortcut
+
+        if not self.is_keyboard_available:
+            return False, "未安装 keyboard，当前回退为应用内快捷键，不是真正全局热键。"
+
+        keyboard_shortcut = normalize_hotkey_for_keyboard(normalized_shortcut)
+
+        try:
+            self.hotkey_handle = keyboard.add_hotkey(
+                keyboard_shortcut,
+                lambda: self.toggleRequested.emit(),
+                suppress=False,
+                trigger_on_release=False,
+            )
+            logging.info("全局热键注册成功: %s -> %s", normalized_shortcut, keyboard_shortcut)
+            return True, ""
+        except Exception as exc:
+            logging.exception("全局热键注册失败")
+            self.hotkey_handle = None
+            return False, f"全局热键注册失败：{exc}"
+
+    def unregister_hotkey(self) -> None:
+        if keyboard is None:
+            self.hotkey_handle = None
+            return
+
+        if self.hotkey_handle is None:
+            return
+
+        try:
+            keyboard.remove_hotkey(self.hotkey_handle)
+        except Exception:
+            logging.exception("移除全局热键失败")
+        finally:
+            self.hotkey_handle = None
+
+    def cleanup(self) -> None:
+        self.unregister_hotkey()
+
+
+class ShortcutLineEdit(QLineEdit):
+    shortcutChanged = Signal(str)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        key = event.key()
+        modifiers = event.modifiers()
+
+        if key in {Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta}:
+            return
+
+        try:
+            modifier_value = int(modifiers.value)
+        except AttributeError:
+            modifier_value = int(modifiers)
+
+        sequence = QKeySequence(modifier_value | key)
+        text = sequence.toString(QKeySequence.NativeText)
+        self.setText(text)
+        self.shortcutChanged.emit(text)
+
+
+class JumpDialog(QDialog):
+    def __init__(self, is_pdf_mode: bool, current_value: int, max_value: int, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.is_pdf_mode = is_pdf_mode
+        self.setWindowTitle("跳转")
+        self.setMinimumWidth(320)
+
+        self.input_edit = QLineEdit()
+        if is_pdf_mode:
+            self.input_edit.setPlaceholderText(f"请输入页码（1 - {max_value}）")
+            self.input_edit.setText(str(current_value))
+            tip_text = "输入目标页码后点击确认。"
+        else:
+            self.input_edit.setPlaceholderText("请输入页码，如 12；或进度百分比，如 35%")
+            self.input_edit.setText(str(current_value))
+            tip_text = "文本模式支持“页码”或“百分比”。"
+
+        self.tip_label = QLabel(tip_text)
+        self.ok_button = QPushButton("确认")
+        self.cancel_button = QPushButton("取消")
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.ok_button)
+        button_layout.addWidget(self.cancel_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.tip_label)
+        layout.addWidget(self.input_edit)
+        layout.addLayout(button_layout)
+
+        self.ok_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+
+    def get_value(self) -> str:
+        return self.input_edit.text().strip()
+
+
+class SettingsDialog(QDialog):
+    settingsChanged = Signal()
+
+    def __init__(self, db: Database, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("设置")
+        self.setMinimumSize(380, 240)
+
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(20, 100)
+        self.opacity_slider.setValue(int(float(self.db.get_setting("opacity") or "1.0") * 100))
+
+        self.font_slider = QSlider(Qt.Horizontal)
+        self.font_slider.setRange(10, 40)
+        self.font_slider.setValue(int(self.db.get_setting("font_size") or "16"))
+
+        self.shortcut_input = ShortcutLineEdit()
+        self.shortcut_input.setText(self.db.get_setting("toggle_shortcut") or "Ctrl+`")
+
+        self.icon_path_input = QLineEdit()
+        self.icon_path_input.setText(self.db.get_setting("tray_icon_path") or "")
+
+        self.opacity_label = QLabel(f"{self.opacity_slider.value()}%")
+        self.font_label = QLabel(str(self.font_slider.value()))
+
+        self.choose_icon_button = QPushButton("选择图片")
+        self.save_button = QPushButton("保存")
+        self.cancel_button = QPushButton("取消")
+
+        self.opacity_slider.valueChanged.connect(self.on_opacity_changed)
+        self.font_slider.valueChanged.connect(self.on_font_changed)
+        self.choose_icon_button.clicked.connect(self.choose_icon)
+        self.save_button.clicked.connect(self.save_settings)
+        self.cancel_button.clicked.connect(self.reject)
+
+        form_layout = QFormLayout()
+        form_layout.addRow("界面透明度", self._row_with_label(self.opacity_slider, self.opacity_label))
+        form_layout.addRow("字体大小", self._row_with_label(self.font_slider, self.font_label))
+        form_layout.addRow("显示/隐藏快捷键", self.shortcut_input)
+        form_layout.addRow("任务栏缩略图", self._row_with_button(self.icon_path_input, self.choose_icon_button))
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.save_button)
+        button_layout.addWidget(self.cancel_button)
+
+        main_layout = QVBoxLayout()
+        main_layout.addLayout(form_layout)
+        main_layout.addStretch()
+        main_layout.addLayout(button_layout)
+        self.setLayout(main_layout)
+
+    def _row_with_label(self, widget: QWidget, label: QLabel) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(widget)
+        layout.addWidget(label)
+        return container
+
+    def _row_with_button(self, widget: QWidget, button: QPushButton) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(widget)
+        layout.addWidget(button)
+        return container
+
+    def on_opacity_changed(self, value: int) -> None:
+        self.opacity_label.setText(f"{value}%")
+        parent = self.parent()
+        if isinstance(parent, QMainWindow):
+            parent.setWindowOpacity(value / 100.0)
+
+    def on_font_changed(self, value: int) -> None:
+        self.font_label.setText(str(value))
+        parent = self.parent()
+        if hasattr(parent, "apply_font_size"):
+            parent.apply_font_size(value)
+
+    def choose_icon(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择图片",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp *.ico)",
+        )
+        if not file_path:
+            return
+        self.icon_path_input.setText(file_path)
+
+    def save_settings(self) -> None:
+        opacity_value = self.opacity_slider.value() / 100.0
+        font_size = self.font_slider.value()
+        shortcut = self.shortcut_input.text().strip() or "Ctrl+`"
+        icon_path_text = self.icon_path_input.text().strip()
+
+        self.db.set_setting("opacity", str(opacity_value))
+        self.db.set_setting("font_size", str(font_size))
+        self.db.set_setting("toggle_shortcut", shortcut)
+
+        if icon_path_text:
+            source_path = Path(icon_path_text)
+            if source_path.exists():
+                target_suffix = source_path.suffix.lower() or ".jpg"
+                target_path = (RESOURCES_DIR / f"TrayIcon{target_suffix}").resolve()
+
+                try:
+                    if not is_same_path(source_path, target_path):
+                        shutil.copyfile(str(source_path), str(target_path))
+                    self.db.set_setting("tray_icon_path", str(target_path))
+                except Exception as exc:
+                    logging.exception("保存托盘图标失败")
+                    self.db.set_setting("tray_icon_path", self.db.get_default_tray_icon_path())
+                    QMessageBox.warning(self, "提示", f"图标保存失败，已回退默认图标。\n{exc}")
+                    return
+            else:
+                self.db.set_setting("tray_icon_path", self.db.get_default_tray_icon_path())
+        else:
+            self.db.set_setting("tray_icon_path", self.db.get_default_tray_icon_path())
+
+        self.settingsChanged.emit()
+        self.accept()
+
+
+class BookmarksDialog(QDialog):
+    bookmarkSelected = Signal(int, dict)
+
+    def __init__(self, db: Database, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("书签")
+        self.setMinimumSize(400, 300)
+
+        self.list_widget = QListWidget()
+        self.refresh()
+
+        self.list_widget.itemDoubleClicked.connect(self.open_bookmark)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.list_widget)
+        self.setLayout(layout)
+
+    def refresh(self) -> None:
+        self.list_widget.clear()
+        for row in self.db.get_bookmarks():
+            try:
+                position = json.loads(row["position"])
+            except Exception:
+                logging.exception("解析书签位置失败")
+                position = {}
+
+            text = f'{row["title"]} - {row["name"]}'
+            item = QListWidgetItem(text)
+            item.setData(
+                Qt.UserRole,
+                {
+                    "bookmark_id": row["id"],
+                    "book_id": row["book_id"],
+                    "position": position,
+                },
+            )
+            self.list_widget.addItem(item)
+
+    def open_bookmark(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.UserRole) or {}
+        book_id = int(data.get("book_id", 0))
+        position = data.get("position", {})
+        if book_id <= 0 or not isinstance(position, dict):
+            return
+        self.bookmarkSelected.emit(book_id, position)
+        self.accept()
+
+    def contextMenuEvent(self, event) -> None:  # type: ignore[override]
+        item = self.list_widget.itemAt(self.list_widget.viewport().mapFromGlobal(event.globalPos()))
+        if item is None:
+            return
+
+        menu = QMenu(self)
+        delete_action = menu.addAction("删除书签")
+        chosen = menu.exec(event.globalPos())
+        if chosen != delete_action:
+            return
+
+        data = item.data(Qt.UserRole) or {}
+        bookmark_id = int(data.get("bookmark_id", 0))
+        if bookmark_id <= 0:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            "确认删除该书签吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            self.db.delete_bookmark(bookmark_id)
+            self.refresh()
+        except Exception:
+            logging.exception("删除书签失败")
+            QMessageBox.warning(self, "错误", "删除书签失败。")
+
+
+class ReaderWindow(QMainWindow):
+    backRequested = Signal()
+
+    def __init__(
+        self,
+        db: Database,
+        book: BookRecord,
+        initial_position: Optional[dict[str, Any]] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.db = db
+        self.book = book
+        self.initial_position = initial_position if isinstance(initial_position, dict) else None
+        self.parsed = BookParser.parse(book.file_path)
+        self.current_pdf_page = 0
+        self.current_text_offset = 0
+        self.text_chars_per_page = 1800
+        self.last_visible_geometry: Optional[bytes] = None
+        self.is_suspended = False
+
+        self.setWindowTitle(book.title)
+        self.setMinimumSize(128, 128)
+        self.resize(1000, 700)
+
+        self.toolbar_widget = QWidget()
+        self.toolbar_layout = QHBoxLayout(self.toolbar_widget)
+        self.toolbar_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.back_button = QPushButton("返回书架")
+        self.settings_button = QPushButton("设置")
+        self.bookmark_button = QPushButton("保存书签")
+        self.jump_button = QPushButton("跳转")
+        self.toc_button = QPushButton("目录跳转")
+
+        self.toolbar_layout.addWidget(self.back_button)
+        self.toolbar_layout.addWidget(self.settings_button)
+        self.toolbar_layout.addWidget(self.bookmark_button)
+        self.toolbar_layout.addWidget(self.jump_button)
+        self.toolbar_layout.addWidget(self.toc_button)
+        self.toolbar_layout.addStretch()
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+
+        self.page_label = QLabel("")
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.addWidget(self.toolbar_widget)
+        layout.addWidget(self.text_edit)
+        layout.addWidget(self.page_label)
+        self.setCentralWidget(container)
+
+        self.back_button.clicked.connect(self.handle_back)
+        self.settings_button.clicked.connect(self.open_settings)
+        self.bookmark_button.clicked.connect(self.save_bookmark)
+        self.jump_button.clicked.connect(self.jump_to_position)
+        self.toc_button.clicked.connect(self.show_toc)
+        self.text_edit.cursorPositionChanged.connect(self.update_status)
+
+        self.load_settings()
+        self.render_initial()
+
+    def ensure_loaded(self) -> None:
+        if not self.is_suspended:
+            return
+
+        self.parsed = BookParser.parse(self.book.file_path)
+        self.text_edit.clear()
+        self.is_suspended = False
+        self.render_initial()
+
+    def suspend_for_idle(self) -> None:
+        if self.is_suspended:
+            return
+
+        try:
+            self.save_progress()
+
+            if self.parsed.get("mode") == "pdf":
+                document = self.parsed.get("doc")
+                if document is not None:
+                    try:
+                        document.close()
+                    except Exception:
+                        logging.exception("释放 PDF 文档失败")
+
+            self.parsed = {
+                "mode": "text",
+                "content": "",
+                "toc": [],
+                "meta": {"suspended": True},
+            }
+            self.text_edit.clear()
+            self.page_label.setText("已隐藏到托盘，内容已释放以降低内存占用。")
+            self.is_suspended = True
+        except Exception:
+            logging.exception("阅读窗口待机释放内存失败")
+
+    def load_settings(self) -> None:
+        opacity = float(self.db.get_setting("opacity") or "1.0")
+        font_size = int(self.db.get_setting("font_size") or "16")
+        self.setWindowOpacity(opacity)
+        self.apply_font_size(font_size)
+
+    def apply_font_size(self, font_size: int) -> None:
+        font = QFont()
+        font.setPointSize(font_size)
+        self.text_edit.setFont(font)
+
+        if font_size <= 12:
+            self.text_chars_per_page = 2400
+        elif font_size <= 16:
+            self.text_chars_per_page = 1800
+        elif font_size <= 20:
+            self.text_chars_per_page = 1400
+        else:
+            self.text_chars_per_page = 1000
+
+    def render_initial(self) -> None:
+        progress = self.initial_position or self.db.get_progress(self.book.id)
+
+        if self.parsed["mode"] == "pdf":
+            page_index = 0
+            if isinstance(progress, dict):
+                page_index = int(progress.get("page", 0))
+            self.render_pdf_page(page_index)
+            return
+
+        content = self.parsed.get("content", "")
+        self.text_edit.setPlainText(content)
+
+        if isinstance(progress, dict):
+            self.restore_position(progress)
+        else:
+            self.update_status()
+
+    def render_pdf_page(self, page_index: int) -> None:
+        self.ensure_loaded()
+        document = self.parsed["doc"]
+        page_count = len(document)
+
+        if page_count <= 0:
+            self.text_edit.setPlainText("[PDF 无页面]")
+            self.current_pdf_page = 0
+            self.update_status()
+            return
+
+        safe_page_index = max(0, min(int(page_index), page_count - 1))
+        page = document.load_page(safe_page_index)
+        text = page.get_text("text")
+        self.text_edit.setPlainText(text if text.strip() else f"[第 {safe_page_index + 1} 页无可提取文本]")
+        self.current_pdf_page = safe_page_index
+        self.update_status()
+
+    def update_status(self) -> None:
+        if self.is_suspended:
+            return
+
+        if self.parsed["mode"] == "pdf":
+            page_count = self.parsed.get("page_count", 0)
+            current_page = min(max(self.current_pdf_page + 1, 1), max(page_count, 1))
+            self.page_label.setText(f"页码：{current_page}/{page_count}")
+            return
+
+        cursor = self.text_edit.textCursor()
+        self.current_text_offset = cursor.position()
+        total_length = max(len(self.parsed.get("content", "")), 1)
+        percent = int(self.current_text_offset / total_length * 100)
+        current_page = max(1, self.current_text_offset // max(1, self.text_chars_per_page) + 1)
+        total_pages = max(1, total_length // max(1, self.text_chars_per_page) + 1)
+        self.page_label.setText(f"阅读进度：{percent}%  |  页码：{current_page}/{total_pages}")
+
+    def get_current_position(self) -> dict[str, Any]:
+        if self.is_suspended:
+            saved_progress = self.db.get_progress(self.book.id)
+            if isinstance(saved_progress, dict):
+                return saved_progress
+            return {"type": "text", "offset": 0}
+
+        if self.parsed["mode"] == "pdf":
+            return {"type": "pdf", "page": self.current_pdf_page}
+        cursor = self.text_edit.textCursor()
+        return {"type": "text", "offset": cursor.position()}
+
+    def restore_position(self, position: dict[str, Any]) -> None:
+        if not isinstance(position, dict):
+            self.update_status()
+            return
+
+        self.ensure_loaded()
+
+        if self.parsed["mode"] == "pdf":
+            if position.get("type") != "pdf":
+                self.render_pdf_page(0)
+                return
+
+            try:
+                page_index = int(position.get("page", 0))
+            except Exception:
+                page_index = 0
+
+            self.render_pdf_page(page_index)
+            return
+
+        if position.get("type") != "text":
+            self.update_status()
+            return
+
+        try:
+            offset = int(position.get("offset", 0))
+        except Exception:
+            offset = 0
+
+        content_length = len(self.parsed.get("content", ""))
+        safe_offset = max(0, min(offset, content_length))
+        cursor = self.text_edit.textCursor()
+        cursor.setPosition(safe_offset)
+        self.text_edit.setTextCursor(cursor)
+        self.text_edit.ensureCursorVisible()
+        self.current_text_offset = safe_offset
+        self.update_status()
+
+    def handle_back(self) -> None:
+        self.save_progress()
+        self.backRequested.emit()
+        self.close()
+
+    def save_progress(self) -> None:
+        self.db.save_progress(self.book.id, self.get_current_position())
+        self.db.set_setting("last_book_id", str(self.book.id))
+
+    def save_bookmark(self) -> None:
+        bookmark_name, ok = QInputDialog.getText(self, "保存书签", "请输入书签名称：")
+        if not ok or not bookmark_name.strip():
+            return
+        self.db.add_bookmark(self.book.id, bookmark_name.strip(), self.get_current_position())
+        QMessageBox.information(self, "提示", f"书签已保存。\n存档目录：{SAVES_DIR}")
+
+    def jump_to_position(self) -> None:
+        self.ensure_loaded()
+
+        if self.parsed["mode"] == "pdf":
+            dialog = JumpDialog(
+                is_pdf_mode=True,
+                current_value=self.current_pdf_page + 1,
+                max_value=self.parsed.get("page_count", 1),
+                parent=self,
+            )
+            if dialog.exec() != QDialog.Accepted:
+                return
+
+            raw_value = dialog.get_value()
+            if not raw_value.isdigit():
+                QMessageBox.warning(self, "提示", "请输入有效页码。")
+                return
+
+            page = int(raw_value)
+            page_count = self.parsed.get("page_count", 1)
+            if page < 1 or page > page_count:
+                QMessageBox.warning(self, "提示", f"页码范围应为 1 - {page_count}。")
+                return
+
+            self.render_pdf_page(page - 1)
+            return
+
+        content_length = len(self.parsed.get("content", ""))
+        total_pages = max(1, content_length // max(1, self.text_chars_per_page) + 1)
+        current_page = max(1, self.current_text_offset // max(1, self.text_chars_per_page) + 1)
+
+        dialog = JumpDialog(
+            is_pdf_mode=False,
+            current_value=current_page,
+            max_value=total_pages,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        raw_value = dialog.get_value()
+        if not raw_value:
+            QMessageBox.warning(self, "提示", "请输入页码或百分比。")
+            return
+
+        if raw_value.endswith("%"):
+            percent_text = raw_value[:-1].strip()
+            if not percent_text.isdigit():
+                QMessageBox.warning(self, "提示", "百分比格式无效，例如：35%。")
+                return
+
+            percent = int(percent_text)
+            if percent < 0 or percent > 100:
+                QMessageBox.warning(self, "提示", "百分比范围应为 0 - 100。")
+                return
+
+            offset = int(content_length * percent / 100)
+            self.restore_position({"type": "text", "offset": offset})
+            return
+
+        if raw_value.isdigit():
+            page = int(raw_value)
+            if page < 1 or page > total_pages:
+                QMessageBox.warning(self, "提示", f"页码范围应为 1 - {total_pages}。")
+                return
+
+            offset = min((page - 1) * self.text_chars_per_page, content_length)
+            self.restore_position({"type": "text", "offset": offset})
+            return
+
+        QMessageBox.warning(self, "提示", "请输入纯数字页码，或百分比，例如：12 / 35%。")
+
+    def show_toc(self) -> None:
+        self.ensure_loaded()
+        toc = self.parsed.get("toc", [])
+        if not toc:
+            QMessageBox.information(self, "提示", "当前文件无可用目录。")
+            return
+
+        items: list[str] = []
+        mapping: dict[str, Any] = {}
+
+        if self.parsed["mode"] == "pdf":
+            for entry in toc:
+                if len(entry) >= 3:
+                    title = str(entry[1])
+                    page = int(entry[2]) - 1
+                    items.append(title)
+                    mapping[title] = {"type": "pdf", "page": page}
+        else:
+            for entry in toc:
+                title = str(entry.get("title", "未命名章节"))
+                offset = int(entry.get("offset", 0))
+                items.append(title)
+                mapping[title] = {"type": "text", "offset": offset}
+
+        if not items:
+            QMessageBox.information(self, "提示", "当前文件无可用目录。")
+            return
+
+        chapter, ok = QInputDialog.getItem(self, "目录跳转", "请选择章节：", items, 0, False)
+        if not ok or not chapter:
+            return
+
+        self.restore_position(mapping[chapter])
+
+    def open_settings(self) -> None:
+        dialog = SettingsDialog(self.db, self)
+        dialog.settingsChanged.connect(self.load_settings)
+        dialog.exec()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        try:
+            self.save_progress()
+            if not self.is_suspended and self.parsed.get("mode") == "pdf":
+                document = self.parsed.get("doc")
+                if document is not None:
+                    document.close()
+        except Exception:
+            logging.exception("关闭阅读窗口时保存状态失败")
+        super().closeEvent(event)
+
+
+class BookCard(QWidget):
+    doubleClicked = Signal(int)
+    deleteRequested = Signal(int)
+
+    def __init__(self, book: BookRecord, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.book = book
+        self.setFixedSize(160, 236)
+
+        self.cover_label = QLabel()
+        self.cover_label.setFixedSize(140, 180)
+        self.cover_label.setAlignment(Qt.AlignCenter)
+        self.cover_label.setStyleSheet("border: 1px solid #999;")
+
+        self.title_label = QLabel(book.title)
+        self.title_label.setAlignment(Qt.AlignCenter)
+        self.title_label.setWordWrap(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(12)
+        layout.addWidget(self.cover_label, alignment=Qt.AlignCenter)
+        layout.addWidget(self.title_label)
+
+        self.render_cover()
+
+    def render_cover(self) -> None:
+        if self.book.cover_path and Path(self.book.cover_path).exists():
+            pixmap = QPixmap(self.book.cover_path)
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(
+                    self.cover_label.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+                self.cover_label.setPixmap(scaled)
+                return
+
+        self.cover_label.setText(self.book.title)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self.doubleClicked.emit(self.book.id)
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event) -> None:  # type: ignore[override]
+        menu = QMenu(self)
+        delete_action = menu.addAction("删除")
+        chosen = menu.exec(event.globalPos())
+        if chosen == delete_action:
+            self.deleteRequested.emit(self.book.id)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, db: Database) -> None:
+        super().__init__()
+        self.db = db
+        self.reader_window: Optional[ReaderWindow] = None
+        self.is_force_quit = False
+        self.last_visible_geometry: Optional[bytes] = None
+        self.bookshelf_dir = self.resolve_bookshelf_dir()
+
+        self.hotkey_manager = GlobalHotkeyManager(self)
+        self.hotkey_manager.toggleRequested.connect(self.toggle_visibility)
+
+        self.fallback_shortcut: Optional[QShortcut] = None
+
+        self.setWindowTitle("快乐摸鱼吧")
+        self.setMinimumSize(128, 128)
+        self.resize(1000, 700)
+
+        self.apply_window_icon()
+        self.setup_tray_icon()
+
+        self.toolbar = self.addToolBar("主工具栏")
+        self.toolbar.setMovable(False)
+
+        self.add_button = QAction("添加文件", self)
+        self.bookmarks_button = QAction("书签", self)
+        self.settings_button = QAction("设置", self)
+        self.select_bookshelf_button = QAction("选择书架目录", self)
+
+        self.toolbar.addAction(self.add_button)
+        self.toolbar.addAction(self.bookmarks_button)
+        self.toolbar.addAction(self.settings_button)
+        self.toolbar.addAction(self.select_bookshelf_button)
+
+        self.add_button.triggered.connect(self.choose_files)
+        self.bookmarks_button.triggered.connect(self.open_bookmarks)
+        self.settings_button.triggered.connect(self.open_settings)
+        self.select_bookshelf_button.triggered.connect(self.select_bookshelf_directory)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setAlignment(Qt.AlignTop)
+        self.grid_layout.setHorizontalSpacing(16)
+        self.grid_layout.setVerticalSpacing(16)
+
+        self.scroll_area.setWidget(self.grid_container)
+
+        self.copyright_label = QLabel("伍冠宇出品 必属精品")
+        self.copyright_label.setAlignment(Qt.AlignCenter)
+        self.copyright_label.setStyleSheet("color: #666; padding: 8px 0 12px 0;")
+
+        self.central_container = QWidget()
+        self.central_layout = QVBoxLayout(self.central_container)
+        self.central_layout.setContentsMargins(0, 0, 0, 0)
+        self.central_layout.setSpacing(0)
+        self.central_layout.addWidget(self.scroll_area)
+        self.central_layout.addWidget(self.copyright_label)
+
+        self.setCentralWidget(self.central_container)
+
+        self.load_settings()
+        self.setup_toggle_shortcut()
+        self.scan_bookshelf_and_sync()
+        self.refresh_bookshelf()
+        self.restore_main_window_geometry()
+
+    def resolve_bookshelf_dir(self) -> Optional[Path]:
+        saved_bookshelf_text = (self.db.get_setting("bookshelf_dir") or "").strip()
+        if saved_bookshelf_text:
+            saved_bookshelf_dir = Path(saved_bookshelf_text)
+            if saved_bookshelf_dir.exists() and saved_bookshelf_dir.is_dir():
+                logging.info("使用已保存书架目录: %s", saved_bookshelf_dir.resolve())
+                return saved_bookshelf_dir.resolve()
+
+        selected_dir = self.ask_user_select_bookshelf_dir(required=False)
+        if selected_dir is not None:
+            self.db.set_setting("bookshelf_dir", str(selected_dir))
+            logging.info("用户首次选择书架目录: %s", selected_dir)
+            return selected_dir
+
+        logging.info("用户未选择书架目录，启动为空书架")
+        return None
+
+    def ask_user_select_bookshelf_dir(self, required: bool = True) -> Optional[Path]:
+        if required:
+            message = "请选择一个文件夹作为书架扫描目录。"
+        else:
+            message = "首次启动未设置书架目录，是否现在选择一个文件夹作为书架扫描目录？"
+
+        reply = QMessageBox.question(
+            self,
+            "选择书架目录",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return None
+
+        selected_dir_text = QFileDialog.getExistingDirectory(
+            self,
+            "选择书架扫描目录",
+            str(BASE_DIR),
+        )
+        if not selected_dir_text:
+            return None
+
+        selected_dir = Path(selected_dir_text).resolve()
+        if not selected_dir.exists() or not selected_dir.is_dir():
+            QMessageBox.warning(self, "提示", "所选目录无效。")
+            return None
+
+        return selected_dir
+
+    def select_bookshelf_directory(self) -> None:
+        base_dir = self.bookshelf_dir if self.bookshelf_dir and self.bookshelf_dir.exists() else BASE_DIR
+        selected_dir_text = QFileDialog.getExistingDirectory(
+            self,
+            "选择书架扫描目录",
+            str(base_dir),
+        )
+        if not selected_dir_text:
+            return
+
+        selected_dir = Path(selected_dir_text).resolve()
+        if not selected_dir.exists() or not selected_dir.is_dir():
+            QMessageBox.warning(self, "提示", "所选目录无效。")
+            return
+
+        self.bookshelf_dir = selected_dir
+        self.db.set_setting("bookshelf_dir", str(selected_dir))
+        self.scan_bookshelf_and_sync()
+        self.refresh_bookshelf()
+        QMessageBox.information(self, "提示", f"书架扫描目录已切换为：\n{selected_dir}")
+
+    def apply_window_icon(self) -> None:
+        icon_path = self.resolve_tray_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
+
+    def resolve_tray_icon_path(self) -> str:
+        icon_path = self.db.get_setting("tray_icon_path") or ""
+        if icon_path and Path(icon_path).exists():
+            return icon_path
+
+        default_icon_path = self.db.get_default_tray_icon_path()
+        if default_icon_path and Path(default_icon_path).exists():
+            return default_icon_path
+
+        return ""
+
+    def setup_tray_icon(self) -> None:
+        self.tray_icon = QSystemTrayIcon(self)
+        self.update_tray_icon()
+
+        self.tray_menu = QMenu(self)
+        self.show_action = self.tray_menu.addAction("显示主界面")
+        self.hide_action = self.tray_menu.addAction("隐藏到托盘")
+        self.tray_menu.addSeparator()
+        self.quit_action = self.tray_menu.addAction("退出")
+
+        self.show_action.triggered.connect(self.restore_from_tray)
+        self.hide_action.triggered.connect(self.hide_to_tray)
+        self.quit_action.triggered.connect(self.quit_application)
+
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon.show()
+
+    def update_tray_icon(self) -> None:
+        icon_path = self.resolve_tray_icon_path()
+        if icon_path:
+            icon = QIcon(icon_path)
+            self.tray_icon.setIcon(icon)
+            self.setWindowIcon(icon)
+
+    def maybe_show_tray_hint(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        if (self.db.get_setting("tray_hint_shown") or "0") == "1":
+            return
+
+        self.tray_icon.showMessage(
+            "喵喵喵喵喵",
+            "喵喵已隐藏到系统托盘，可点击托盘图标恢复。",
+            QSystemTrayIcon.Information,
+            2000,
+        )
+        self.db.set_setting("tray_hint_shown", "1")
+
+    def load_settings(self) -> None:
+        opacity = float(self.db.get_setting("opacity") or "1.0")
+        self.setWindowOpacity(opacity)
+
+    def setup_toggle_shortcut(self) -> None:
+        shortcut_text = self.db.get_setting("toggle_shortcut") or "Ctrl+`"
+
+        if self.fallback_shortcut is not None:
+            try:
+                self.fallback_shortcut.activated.disconnect(self.toggle_visibility)
+            except Exception:
+                pass
+            self.fallback_shortcut.setParent(None)
+            self.fallback_shortcut = None
+
+        success, message = self.hotkey_manager.register_hotkey(shortcut_text)
+
+        if success:
+            return
+
+        logging.warning(message)
+        self.fallback_shortcut = QShortcut(QKeySequence(shortcut_text), self)
+        self.fallback_shortcut.setContext(Qt.ApplicationShortcut)
+        self.fallback_shortcut.activated.connect(self.toggle_visibility)
+
+    def scan_bookshelf_and_sync(self) -> None:
+        if self.bookshelf_dir is None:
+            logging.info("未设置书架目录，跳过扫描")
+            return
+
+        try:
+            logging.info("开始扫描书架目录: %s", self.bookshelf_dir)
+
+            bookshelf_files: list[Path] = []
+            for extension in SUPPORTED_EXTENSIONS:
+                matched_files = list(self.bookshelf_dir.rglob(f"*{extension}"))
+                logging.info("扩展名 %s 匹配到 %d 个文件", extension, len(matched_files))
+                bookshelf_files.extend(matched_files)
+
+            normalized_bookshelf_paths = {
+                str(path.resolve())
+                for path in bookshelf_files
+                if path.is_file()
+            }
+
+            logging.info("本次共扫描到 %d 个文件", len(normalized_bookshelf_paths))
+
+            for file_path_text in normalized_bookshelf_paths:
+                file_path = Path(file_path_text)
+                title = BookParser.extract_title(file_path)
+                cover_path = BookParser.extract_cover(file_path)
+                self.db.add_book(title, file_path_text, file_path.suffix.lower(), cover_path)
+
+            bookshelf_root = self.bookshelf_dir.resolve()
+            existing_books = self.db.get_books()
+
+            for book in existing_books:
+                book_path = Path(book.file_path)
+                is_in_current_bookshelf = False
+
+                try:
+                    is_in_current_bookshelf = book_path.resolve().is_relative_to(bookshelf_root)
+                except Exception:
+                    try:
+                        book_resolved = str(book_path.resolve())
+                        bookshelf_resolved = str(bookshelf_root)
+                        is_in_current_bookshelf = book_resolved.startswith(bookshelf_resolved)
+                    except Exception:
+                        is_in_current_bookshelf = False
+
+                if is_in_current_bookshelf and not book_path.exists():
+                    if book.cover_path and Path(book.cover_path).exists():
+                        try:
+                            Path(book.cover_path).unlink()
+                        except Exception:
+                            logging.exception("删除失效封面缓存失败")
+                    self.db.delete_book(book.id)
+
+        except Exception:
+            logging.exception("扫描书架目录并同步书架失败")
+
+    def is_any_window_visible(self) -> bool:
+        if self.reader_window is not None and self.reader_window.isVisible():
+            return True
+        return self.isVisible()
+
+    def toggle_visibility(self) -> None:
+        if self.is_any_window_visible():
+            self.hide_to_tray()
+            return
+        self.restore_from_tray()
+
+    def save_main_window_geometry(self) -> None:
+        try:
+            geometry_bytes = bytes(self.saveGeometry().data())
+            geometry_text = geometry_bytes.hex()
+            self.db.set_setting("main_window_geometry", geometry_text)
+        except Exception:
+            logging.exception("保存主窗口几何信息失败")
+
+    def restore_main_window_geometry(self) -> None:
+        geometry_text = (self.db.get_setting("main_window_geometry") or "").strip()
+        if not geometry_text:
+            return
+
+        try:
+            geometry_bytes = bytes.fromhex(geometry_text)
+            self.restoreGeometry(geometry_bytes)
+        except Exception:
+            logging.exception("恢复主窗口几何信息失败")
+
+    def _capture_visible_geometry(self, window: QWidget) -> Optional[bytes]:
+        try:
+            if window.isMinimized():
+                return None
+            return bytes(window.saveGeometry().data())
+        except Exception:
+            logging.exception("记录窗口几何信息失败")
+            return None
+
+    def hide_to_tray(self) -> None:
+        try:
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                if self.reader_window is not None and self.reader_window.isVisible():
+                    self.reader_window.showMinimized()
+                else:
+                    self.showMinimized()
+                return
+
+            if self.reader_window is not None and self.reader_window.isVisible():
+                reader_geometry = self._capture_visible_geometry(self.reader_window)
+                if reader_geometry is not None:
+                    self.reader_window.last_visible_geometry = reader_geometry
+                self.reader_window.suspend_for_idle()
+                self.reader_window.hide()
+
+            if self.isVisible():
+                main_geometry = self._capture_visible_geometry(self)
+                if main_geometry is not None:
+                    self.last_visible_geometry = main_geometry
+                    self.save_main_window_geometry()
+                self.hide()
+
+            self.tray_icon.show()
+            self.maybe_show_tray_hint()
+        except Exception:
+            logging.exception("隐藏到托盘失败")
+
+    def _restore_window(self, window: QWidget, geometry_bytes: Optional[bytes] = None) -> None:
+        window.setWindowState(window.windowState() & ~Qt.WindowMinimized)
+
+        if isinstance(window, ReaderWindow):
+            window.ensure_loaded()
+
+        if geometry_bytes:
+            try:
+                window.restoreGeometry(geometry_bytes)
+            except Exception:
+                logging.exception("恢复窗口几何信息失败")
+
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def restore_from_tray(self) -> None:
+        try:
+            if self.reader_window is not None:
+                self._restore_window(self.reader_window, self.reader_window.last_visible_geometry)
+                return
+
+            geometry_bytes = self.last_visible_geometry
+            if geometry_bytes is None:
+                geometry_text = (self.db.get_setting("main_window_geometry") or "").strip()
+                if geometry_text:
+                    try:
+                        geometry_bytes = bytes.fromhex(geometry_text)
+                    except Exception:
+                        logging.exception("解析主窗口几何信息失败")
+                        geometry_bytes = None
+
+            self._restore_window(self, geometry_bytes)
+        except Exception:
+            logging.exception("从托盘恢复窗口失败")
+
+    def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick}:
+            self.restore_from_tray()
+
+    def quit_application(self) -> None:
+        self.is_force_quit = True
+
+        try:
+            self.save_main_window_geometry()
+        except Exception:
+            logging.exception("退出前保存主窗口几何信息失败")
+
+        try:
+            self.hotkey_manager.cleanup()
+        except Exception:
+            logging.exception("释放全局热键失败")
+
+        try:
+            if self.reader_window is not None:
+                try:
+                    self.reader_window.save_progress()
+                except Exception:
+                    logging.exception("退出前保存阅读进度失败")
+
+                try:
+                    self.reader_window.close()
+                except Exception:
+                    logging.exception("关闭阅读窗口失败")
+
+                self.reader_window = None
+        except Exception:
+            logging.exception("退出流程处理阅读窗口失败")
+
+        try:
+            if hasattr(self, "tray_icon"):
+                self.tray_icon.hide()
+        except Exception:
+            logging.exception("隐藏托盘图标失败")
+
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+        os._exit(0)
+
+    def clear_grid(self) -> None:
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def refresh_bookshelf(self) -> None:
+        self.clear_grid()
+        books = self.db.get_books()
+
+        row = 0
+        col = 0
+        max_cols = 5
+
+        for book in books:
+            card = BookCard(book)
+            card.doubleClicked.connect(self.open_reader)
+            card.deleteRequested.connect(self.delete_book)
+            self.grid_layout.addWidget(card, row, col)
+
+            col += 1
+            if col >= max_cols:
+                col = 0
+                row += 1
+
+    def choose_files(self) -> None:
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择小说文件",
+            "",
+            "Books (*.txt *.pdf *.epub *.mobi)",
+        )
+        if not file_paths:
+            return
+
+        for file_path in file_paths:
+            path = Path(file_path)
+            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+
+            if not path.exists():
+                continue
+
+            title = BookParser.extract_title(path)
+            cover_path = BookParser.extract_cover(path)
+            self.db.add_book(title, str(path.resolve()), path.suffix.lower(), cover_path)
+
+        self.refresh_bookshelf()
+
+    def open_reader(self, book_id: int) -> None:
+        book = self.db.get_book(book_id)
+        if not book:
+            QMessageBox.warning(self, "错误", "书籍不存在。")
+            return
+
+        if not Path(book.file_path).exists():
+            QMessageBox.warning(self, "错误", "源文件不存在。")
+            return
+
+        if self.reader_window is not None:
+            try:
+                self.reader_window.save_progress()
+            except Exception:
+                logging.exception("切换书籍时保存进度失败")
+            self.reader_window.close()
+
+        if self.isVisible():
+            main_geometry = self._capture_visible_geometry(self)
+            if main_geometry is not None:
+                self.last_visible_geometry = main_geometry
+                self.save_main_window_geometry()
+
+        self.reader_window = ReaderWindow(self.db, book, parent=self)
+        self.reader_window.backRequested.connect(self.show_bookshelf)
+        self.reader_window.destroyed.connect(self.on_reader_destroyed)
+        self.db.set_setting("last_book_id", str(book.id))
+
+        self.reader_window.show()
+        self.hide()
+
+    def show_bookshelf(self) -> None:
+        self._restore_window(self, self.last_visible_geometry)
+
+    def on_reader_destroyed(self) -> None:
+        self.reader_window = None
+
+    def try_restore_last_reading(self) -> None:
+        last_book_id = (self.db.get_setting("last_book_id") or "").strip()
+        if not last_book_id.isdigit():
+            return
+
+        book = self.db.get_book(int(last_book_id))
+        if not book:
+            return
+
+        if not Path(book.file_path).exists():
+            return
+
+        self.open_reader(book.id)
+
+    def delete_book(self, book_id: int) -> None:
+        book = self.db.get_book(book_id)
+        if not book:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确认删除《{book.title}》吗？\n这将删除书架记录、源文件、封面缓存、书签和阅读进度。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        if book.cover_path and Path(book.cover_path).exists():
+            try:
+                Path(book.cover_path).unlink()
+            except Exception:
+                logging.exception("删除封面缓存失败")
+
+        if Path(book.file_path).exists():
+            try:
+                Path(book.file_path).unlink()
+            except Exception:
+                logging.exception("删除源文件失败")
+
+        last_book_id = self.db.get_setting("last_book_id") or ""
+        if last_book_id.isdigit() and int(last_book_id) == book_id:
+            self.db.set_setting("last_book_id", "")
+
+        if self.reader_window is not None and self.reader_window.book.id == book_id:
+            try:
+                self.reader_window.close()
+            except Exception:
+                logging.exception("关闭阅读窗口失败")
+            self.reader_window = None
+
+        self.db.delete_book(book_id)
+        self.refresh_bookshelf()
+
+    def open_bookmarks(self) -> None:
+        dialog = BookmarksDialog(self.db, self)
+        dialog.bookmarkSelected.connect(self.open_bookmark_target)
+        dialog.exec()
+
+    def open_bookmark_target(self, book_id: int, position: dict) -> None:
+        book = self.db.get_book(book_id)
+        if not book:
+            QMessageBox.warning(self, "错误", "书籍不存在。")
+            return
+
+        if not Path(book.file_path).exists():
+            QMessageBox.warning(self, "错误", "源文件不存在。")
+            return
+
+        if not isinstance(position, dict):
+            QMessageBox.warning(self, "错误", "书签位置数据无效。")
+            return
+
+        if self.reader_window is not None:
+            try:
+                self.reader_window.save_progress()
+            except Exception:
+                logging.exception("打开书签前保存进度失败")
+            self.reader_window.close()
+
+        if self.isVisible():
+            main_geometry = self._capture_visible_geometry(self)
+            if main_geometry is not None:
+                self.last_visible_geometry = main_geometry
+                self.save_main_window_geometry()
+
+        self.reader_window = ReaderWindow(self.db, book, initial_position=position, parent=self)
+        self.reader_window.backRequested.connect(self.show_bookshelf)
+        self.reader_window.destroyed.connect(self.on_reader_destroyed)
+        self.db.set_setting("last_book_id", str(book.id))
+
+        self.reader_window.show()
+        self.hide()
+
+    def open_settings(self) -> None:
+        dialog = SettingsDialog(self.db, self)
+        dialog.settingsChanged.connect(self.on_settings_changed)
+        dialog.exec()
+
+    def on_settings_changed(self) -> None:
+        self.load_settings()
+        self.setup_toggle_shortcut()
+        self.update_tray_icon()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        event.ignore()
+        self.quit_application()
+
+
+def main() -> None:
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    instance_guard = SingleInstanceGuard(LOCK_PATH)
+    if not instance_guard.try_acquire():
+        QMessageBox.information(None, "提示", "程序已在运行，请勿重复启动。")
+        sys.exit(0)
+
+    db = Database(DB_PATH)
+
+    default_icon_path = db.get_default_tray_icon_path()
+    if default_icon_path and Path(default_icon_path).exists():
+        app.setWindowIcon(QIcon(default_icon_path))
+
+    try:
+        window = MainWindow(db)
+        window.show()
+        window.try_restore_last_reading()
+        exit_code = app.exec()
+    finally:
+        instance_guard.release()
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
